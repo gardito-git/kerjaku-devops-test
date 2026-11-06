@@ -76,3 +76,28 @@ A diagram or numbered steps is fine. Write the new `.gitlab-ci.yml` , or detaile
 | 11 | **No concurrency control** (`concurrent = 4` on the runner, no `resource_group`) | Two pipelines can deploy at the same time and interleave `stop`/`run` on the same host. |
 | 12 | **`image: alpine:latest`** + `apk add` each run, and hard-coded host IPs | Non-reproducible job image; a new server isn't deployed to until someone edits YAML. |
 | 13 | **No tests, no lint, no image scan, no environment tracking, no notification** | Nothing stops a broken build. GitLab shows no deployment history, so nobody knows what's live. |
+
+### 2. Review the runner setup (File D2 and the facts). List the risks, then describe how you would set up GitLab Runners for KerjaKu: where they run, which executor, how they get AWS access, how build jobs are kept apart from production deploys, and which settings you would use for tags, protected branches and variables. (6 pts)
+| Risk | Impact |
+|---|---|
+| Runner lives on **web-1, a production web server** | Every CI job (any project's) runs next to production traffic. Builds steal CPU and RAM, and a compromised job means a compromised production server. |
+| **`privileged = true` + `/var/run/docker.sock` mounted** | Either one alone gives any job **root on the host**: `docker run -v /:/host …`. That means root on web-1, with its `.env` and network access to RDS. |
+| **`/root/.ssh` mounted into every job** | Any job can read root's private keys and `known_hosts` and SSH to every server those keys open. |
+| **Instance runner + runs untagged jobs + not limited to protected branches** | *Any* project on the GitLab server, from *any* branch or MR, by *any* developer, runs on that production box. An intern's test project = root on prod. |
+| **Variables not Protected/Masked** | Any branch's job can read `PROD_SSH_KEY` and `DB_PASSWORD`; they also show up in logs. |
+| **Shared `/cache` volume** across all projects | Cache poisoning: one project can plant a modified `node_modules` that another project then ships. |
+| Runner token in plain text; `alpine:latest` default image; `concurrent = 4` on a 4 GB web server | Token leaks give the ability to impersonate the runner and steal jobs (and their secrets). Unpinned images. OOM risk on prod. |
+
+#### How I'd set up GitLab Runners for KerjaKu
+| Question | Design |
+|---|---|
+| **Where they run** | On **dedicated** EC2 in **private subnets** of a separate "CI" subnet/SG, never on web servers. Two separate pools: **build** and **deploy**. The CI SG has no inbound rules and is not allowed into the RDS SG. |
+| **Executor** | **Build:** `docker-autoscaler` (GitLab's fleeting AWS plugin) with an ASG of spot instances. **One job per VM, then it's destroyed** (`max_use_count = 1`). Because each VM is disposable, `privileged` (for docker-in-docker builds) is acceptable *only here*. Config: [`runner/config.build.toml`](part2-pipeline/runner/config.build.toml). **Deploy:** a small dedicated `docker` executor, **not privileged, no host volumes, no docker.sock**, `concurrent = 1`. Config: [`runner/config.deploy.toml`](part2-pipeline/runner/config.deploy.toml). |
+| **AWS access** | **No AWS keys anywhere.** Jobs use **GitLab OIDC (`id_tokens`) → `AssumeRoleWithWebIdentity`**, which gives 1-hour credentials per job. Each role's trust policy is pinned to the GitLab `sub` claim: the build role accepts `project_path:kerjaku/web:*` and can only push to the `kerjaku-app` ECR repo. The deploy role accepts only `project_path:kerjaku/web:ref_type:branch:ref:main` and can only call ELB (de)register on our target group, `ssm:SendCommand` to instances tagged `App=kerjaku`, and Get/Put on `/kerjaku/prod/*` parameters. *Caveat:* with self-hosted GitLab, AWS STS must be able to reach `https://gitlab…/.well-known/openid-configuration` and the JWKS URL. If GitLab can't be exposed for that, the fallback is an **instance profile on the deploy runner host**, which is safe only because that runner is protected and project-locked. |
+| **Build vs. deploy separation** | Different runners, different tags (`kerjaku-build`, `kerjaku-deploy`), different IAM roles. Build jobs (which run MR code) can't deploy: they have no deploy role and can't use the deploy runner. Deploy jobs run *no project code except our deploy scripts*. They call AWS APIs and **SSM Run Command** (no SSH, no keys, every command logged in CloudTrail). |
+| **Registration scope & tags** | Build runner = **group runner** for `kerjaku/*`, not an instance runner. Deploy runner = **project runner** locked to `kerjaku/web`. **"Run untagged jobs" = off** on both. |
+| **Protected branches** | `main` and `v*` tags are protected: merge only via MR, ≥1 approval, pipeline must pass, no force-push. The **deploy runner is marked "Protected"**, so it only runs jobs from protected refs. |
+| **Protected environments** | `production` is a protected environment: only the "deployers" group may run its jobs (optionally with a required approval for out-of-hours deploys). |
+| **Variables** | The only CI/CD variables are non-secret config (ARNs, region). Anything sensitive (ideally nothing) is **Protected + Masked and hidden + scoped to `environment: production`**. App secrets live in Secrets Manager and never pass through CI. |
+| **Hygiene** | The runner token is rotated now (it's been on a shared host) and the file is `0600`. `allowed_images`/`allowed_services` are restricted to ECR + pinned public images. Cache goes to S3 per project, not a shared host dir. Runner managers are built from IaC. The old web-1 runner is unregistered and removed. |
+

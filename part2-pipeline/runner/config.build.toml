@@ -1,0 +1,69 @@
+# /etc/gitlab-runner/config.toml on the BUILD runner manager (small EC2 in a private subnet, NOT a web server)
+#
+# Registered in GitLab as a GROUP runner for the `kerjaku` group (not an instance runner).
+# Registration settings (set in the GitLab UI when creating the runner, not in this file):
+#   tags: kerjaku-build      run untagged jobs: NO      protected: NO (MR pipelines need it)
+#
+# Every job gets a brand-new EC2 VM from an Auto Scaling Group and the VM is destroyed afterwards
+# (max_use_count = 1). That isolation is why `privileged = true` (needed for docker-in-docker
+# image builds) is acceptable here and nowhere else: a malicious job can only break its own
+# throw-away VM, which has no SSH keys, no prod network access and an IAM role that can do nothing.
+# AWS access for jobs comes from GitLab OIDC → IAM role (ECR push to kerjaku-app only).
+
+concurrent = 10
+check_interval = 3
+shutdown_timeout = 0
+
+[[runners]]
+  name = "kerjaku-build-autoscaler"
+  url = "https://gitlab.kerjaku.example.com"
+  token = "glrt-REDACTED"          # file is root:root 0600; token rotated after the old one leaked
+  executor = "docker-autoscaler"
+
+  [runners.docker]
+    image = "public.ecr.aws/docker/library/alpine:3.20"
+    privileged = true                # only OK because the VM is single-use, see above
+    volumes = ["/certs/client"]      # docker-in-docker TLS certs only; no host paths, no docker.sock
+    allowed_images = [
+      "123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/*",
+      "node:20*",
+      "docker:27*",
+      "public.ecr.aws/docker/library/*",
+    ]
+    allowed_services = ["docker:27*"]
+    allowed_pull_policies = ["always", "if-not-present"]
+
+  [runners.cache]
+    Type = "s3"
+    Shared = false                   # cache is per-runner/per-project key, not one shared dir
+    [runners.cache.s3]
+      ServerAddress = "s3.amazonaws.com"
+      BucketName = "kerjaku-gitlab-runner-cache"
+      BucketLocation = "ap-southeast-1"
+      AuthenticationType = "iam"     # runner manager's instance role, scoped to this bucket
+
+  [runners.autoscaler]
+    plugin = "aws:1.0.0"             # fleeting-plugin-aws, pinned
+    capacity_per_instance = 1
+    max_use_count = 1                # one job per VM, then terminate
+    max_instances = 10
+
+    [runners.autoscaler.plugin_config]
+      name = "kerjaku-ci-build-asg"  # ASG of spot instances in private subnets, no inbound SG rules
+      region = "ap-southeast-1"
+
+    [runners.autoscaler.connector_config]
+      username = "ubuntu"
+      use_external_addr = false
+
+    [[runners.autoscaler.policy]]
+      idle_count = 2                 # warm VMs during office hours (WIB)
+      idle_time = "15m"
+      periods = ["* 8-20 * * mon-fri"]
+      timezone = "Asia/Jakarta"
+
+    [[runners.autoscaler.policy]]
+      idle_count = 0
+      idle_time = "5m"
+      periods = ["* 21-23,0-7 * * *", "* * * * sat,sun"]
+      timezone = "Asia/Jakarta"
