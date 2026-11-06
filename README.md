@@ -6,9 +6,11 @@ All config files and scripts referenced below are in this repository:
 | Folder | Contents |
 |---|---|
 | [`part1-server/`](part1-server/) | Nginx site config, SSH hardening, Docker Compose service, log rotation / journald / Docker log limits |
-| [`part2-pipeline/`](part2-pipeline/) | New `.gitlab-ci.yml`, rolling deploy + rollback scripts, host-side deploy script, GitLab Runner configs |
-| [`part3-terraform/`](part3-terraform/) | Rewritten `web.tf` (SG, IAM role, launch template, ASG), `variables.tf`, `versions.tf` with S3 backend (`terraform validate` passes) |
-| [`part5-script/`](part5-script/) | `post-deploy-check.sh` + a test harness (`test/run-tests.sh`, 10 cases, all passing) |
+| [`part2-pipeline/`](part2-pipeline/) | 
+| [`part3-terraform/`](part3-terraform/) | 
+| [`part4-rca/`](part4-rca/) | 
+| [`part5-script/`](part5-script/) | 
+| [`part6-secrets/`](part6-secrets/) | 
 
 ## Global assumptions
 
