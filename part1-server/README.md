@@ -99,30 +99,30 @@ File A:
   ```yaml
   Requests with any `Host` header are proxied to the app (host-header attacks, scanner noise in app logs).
   ```
-  File B:
-  - Critical
-    - Issue
 
-    SG allows 22 from 0.0.0.0/0, with PermitRootLogin yes, PasswordAuthentication yes and MaxAuthTries 10
-    ```yaml
-    Internet-wide password brute force against root. One guessed password means full control of production.
-    ```
-  - High
-    - Issue
+File B:
+- Critical
+- Issue
 
-    PermitRootLogin yes
-    ```yaml
-    No per-person attribution, and root compromise is immediate. Use named accounts with sudo. Even better, use SSM Session Manager.
-    ```
-    PasswordAuthentication yes
-    ```yaml
-    Passwords can be guessed, phished or reused. Keys (or SSM) only.
-    ```
-  - Medium
-    - Issue
+SG allows 22 from 0.0.0.0/0, with PermitRootLogin yes, PasswordAuthentication yes and MaxAuthTries 10
+```yaml
+Internet-wide password brute force against root. One guessed password means full control of production.
+```
+- High
+- Issue
 
-    MaxAuthTries 10
-    ```yaml
-    10 guesses per connection makes brute force 3–5× faster. Use 3.
-    ```
-    
+PermitRootLogin yes
+```yaml
+No per-person attribution, and root compromise is immediate. Use named accounts with sudo. Even better, use SSM Session Manager.
+```
+PasswordAuthentication yes
+```yaml
+Passwords can be guessed, phished or reused. Keys (or SSM) only.
+```
+- Medium
+- Issue
+
+MaxAuthTries 10
+```yaml
+10 guesses per connection makes brute force 3–5× faster. Use 3.
+```
