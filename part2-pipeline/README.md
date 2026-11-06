@@ -77,7 +77,9 @@ A diagram or numbered steps is fine. Write the new `.gitlab-ci.yml` , or detaile
 | 12 | **`image: alpine:latest`** + `apk add` each run, and hard-coded host IPs | Non-reproducible job image; a new server isn't deployed to until someone edits YAML. |
 | 13 | **No tests, no lint, no image scan, no environment tracking, no notification** | Nothing stops a broken build. GitLab shows no deployment history, so nobody knows what's live. |
 
-### 2. Review the runner setup (File D2 and the facts). List the risks, then describe how you would set up GitLab Runners for KerjaKu: where they run, which executor, how they get AWS access, how build jobs are kept apart from production deploys, and which settings you would use for tags, protected branches and variables. (6 pts)
+### 2. Review the runner setup (File D2 and the facts). 
+List the risks, then describe how you would set up GitLab Runners for KerjaKu: where they run, which executor, how they get AWS access, how build jobs are kept apart from production deploys, and which settings you would use for tags, protected branches and variables. (6 pts)
+---
 | Risk | Impact |
 |---|---|
 | Runner lives on **web-1, a production web server** | Every CI job (any project's) runs next to production traffic. Builds steal CPU and RAM, and a compromised job means a compromised production server. |
@@ -87,8 +89,8 @@ A diagram or numbered steps is fine. Write the new `.gitlab-ci.yml` , or detaile
 | **Variables not Protected/Masked** | Any branch's job can read `PROD_SSH_KEY` and `DB_PASSWORD`; they also show up in logs. |
 | **Shared `/cache` volume** across all projects | Cache poisoning: one project can plant a modified `node_modules` that another project then ships. |
 | Runner token in plain text; `alpine:latest` default image; `concurrent = 4` on a 4 GB web server | Token leaks give the ability to impersonate the runner and steal jobs (and their secrets). Unpinned images. OOM risk on prod. |
-
-#### How I'd set up GitLab Runners for KerjaKu
+---
+How I'd set up GitLab Runners for KerjaKu
 | Question | Design |
 |---|---|
 | **Where they run** | On **dedicated** EC2 in **private subnets** of a separate "CI" subnet/SG, never on web servers. Two separate pools: **build** and **deploy**. The CI SG has no inbound rules and is not allowed into the RDS SG. |
@@ -100,4 +102,136 @@ A diagram or numbered steps is fine. Write the new `.gitlab-ci.yml` , or detaile
 | **Protected environments** | `production` is a protected environment: only the "deployers" group may run its jobs (optionally with a required approval for out-of-hours deploys). |
 | **Variables** | The only CI/CD variables are non-secret config (ARNs, region). Anything sensitive (ideally nothing) is **Protected + Masked and hidden + scoped to `environment: production`**. App secrets live in Secrets Manager and never pass through CI. |
 | **Hygiene** | The runner token is rotated now (it's been on a shared host) and the file is `0600`. `allowed_images`/`allowed_services` are restricted to ECR + pinned public images. Cache goes to S3 per project, not a shared host dir. Runner managers are built from IaC. The old web-1 runner is unregistered and removed. |
+---
+### 3. Design a better deployment process for KerjaKu. 
+It must cover:
+- zero-downtime releases across both servers behind the ALB
+- a one-step rollback to the previous version, in under 5 minutes
+- where images are built and stored, and how they are tagged
+- how database migrations run safely (including a migration that would break the old version still running)
+- how secrets reach the app
 
+A diagram or numbered steps is fine. Write the new `.gitlab-ci.yml` , or detailed pseudo-YAML. (10 pts)
+
+---
+Full files: [`.gitlab-ci.yml`](part2-pipeline/.gitlab-ci.yml), [`scripts/rolling-deploy.sh`](part2-pipeline/scripts/rolling-deploy.sh), [`scripts/kerjaku-host-deploy`](part2-pipeline/scripts/kerjaku-host-deploy) (installed on every web server), [`scripts/lib.sh`](part2-pipeline/scripts/lib.sh).
+
+
+Flow
+```
+ MR pipeline:   lint + unit tests ─► secret detection ─► build image (not pushed to prod tags)
+ main pipeline:
+ ┌────────┐   ┌──────────────────────┐   ┌──────────────┐   ┌──────────────────────────────┐   ┌────────┐
+ │  test  │──►│ build → ECR          │──►│ ▶ migrate    │──►│ rolling deploy               │──►│ verify │
+ │        │   │ kerjaku-app:<sha>    │   │ (manual btn, │   │ host 1: drain→deploy→check→  │   │ smoke  │
+ │        │   │ scan, block CRITICAL │   │  once, new   │   │         register→healthy     │   │ test   │
+ └────────┘   └──────────────────────┘   │  image)      │   │ host 2: same                 │   └────────┘
+                                         └──────────────┘   │ fail → that host rolls back, │
+                                                            │        pipeline stops (red)  │
+ ▶ rollback (manual, any time): rolling deploy of /kerjaku/prod/previous_image, no build, no migration
+```
+---
+Zero-downtime releases across both servers
+`rolling-deploy.sh` does, **one server at a time**:
+1. **Pre-check:** all targets must be healthy and there must be ≥ 2. Otherwise it refuses to start, because taking a host out of a degraded fleet would cause an outage.
+2. **Deregister** the host from the ALB target group and `wait target-deregistered`. The ALB stops sending new requests and lets in-flight ones finish. Target group `deregistration_delay = 30s`, down from the 300 s default. That one setting decides whether a deploy takes 2 minutes or 10.
+3. **Deploy on the host via SSM Run Command:** `kerjaku-host-deploy deploy <image>` pulls the image from ECR, refreshes secrets from Secrets Manager, saves the current release as `release.env.previous`, runs `docker compose up -d --wait` (waits for the container healthcheck), then runs **`post-deploy-check.sh`** (Part 5).
+4. **If anything fails:** that host is rolled back to its previous image and put back in the target group, and the pipeline stops red. **The other host never received the bad release**, so users see no outage, only reduced capacity for a minute.
+5. **Register** the host and `wait target-in-service` (the ALB health check on `/health` must pass), then move on to the next host.
+6. After all hosts succeed, record the release: SSM Parameter `/kerjaku/prod/previous_image` ← old, `/kerjaku/prod/current_image` ← new. New ASG instances read `current_image` at boot (Part 3), so scale-out never launches a stale or "latest" version.
+
+Capacity note: with 2 servers, one carries 100% of traffic during a deploy. web-1 (4 GB) can't. Both servers need the same size (Part 4), or we deploy with 3 instances (scale out by one first). Once the ASG from Part 3 exists, this becomes **ASG instance refresh** with `min_healthy_percentage = 100` and `max_healthy_percentage = 200` (new instances come up *before* old ones leave). It's the same process, managed by AWS.
+---
+One-step rollback in under 5 minutes
+- Every build is kept in ECR as an **immutable** `kerjaku-app:<git-sha>` (tag immutability on; lifecycle policy keeps the last 50).
+- **The `rollback_production` job** (manual button on every `main` pipeline) runs the same rolling deploy with `/kerjaku/prod/previous_image`. GitLab's own *Environments → production → Rollback* button does the same thing by re-running an older pipeline's deploy job (its `$IMAGE` is still in ECR).
+- **Why < 5 min:** no build, no migration. The previous image is usually still cached on the host (we prune only images older than 7 days). Per host it's about 30 s drain + 30 s container switch + 30 s ALB health check, so ~1.5 min. Two hosts ≈ 3 min.
+- Rollback only works if the **database is still compatible with the old version**. That's why migrations follow the rule below.
+---
+Where images are built, stored and tagged
+- **Built** once per commit in CI, on ephemeral build runners. Never on servers.
+- **Stored** in **Amazon ECR** (`kerjaku-app`, same region), with scan-on-push enabled. The pipeline fails on CRITICAL findings.
+- **Tagged** with `:<full git SHA>`, which is what is deployed and rolled back. Release tags (`v2.14.0`) get an extra alias for humans. **`latest` is never used** for deploys. Image labels record the commit and pipeline URL, and the running version is visible in `/health`.
+---
+Migrations, safely: "expand → migrate → contract"
+- Migrations run **once**, as their own pipeline step **before** the code rollout, using the **new image** (`kerjaku-host-deploy migrate <image>` on one host via SSM, so the DB password never touches CI). The migration tool takes a DB lock, so an accidental second run waits.
+- **Rule: every migration must work with both the old and the new code**, because during a rolling deploy (and after a rollback) both versions run against the same schema.
+- **A change that would break the old version is split across releases.** Example: renaming `jobs.salary` → `jobs.salary_min`:
+  1. **Release A (expand):** add `salary_min` (nullable). Code writes **both** columns and reads the old one.
+  2. **Backfill** in batches (a background SQS job, 1 000 rows at a time, not one huge `UPDATE` that locks the table).
+  3. **Release B:** code reads `salary_min`, still writes both. Rollback to A is still safe.
+  4. **Release C (contract):** a week later, once rollback to A is no longer needed, drop `salary`.
+- **MySQL 8 specifics:** use `ALGORITHM=INSTANT` or `INPLACE, LOCK=NONE` where possible, set a low `lock_wait_timeout` in the migration session so a blocked DDL fails instead of queuing every query behind it, and use `gh-ost`/`pt-online-schema-change` for big tables (e.g. `jobs`, ~480k rows).
+- **Guardrails:** a CI check (`npm run migrations:check`) fails if a migration contains `DROP`/`RENAME`/`NOT NULL without default` unless the MR has a `db-contract` label and a second approval. RDS automated backups + point-in-time recovery are on. For risky migrations, take a manual snapshot first.
+---
+How secrets reach the app
+- Secrets live in **AWS Secrets Manager** (`kerjaku/prod/app`). Each web server's **EC2 instance role** may read only `kerjaku/prod/*`.
+- At deploy (and boot), `kerjaku-host-deploy` writes them to `/etc/kerjaku/kerjaku.env` (`root:root 0600`), which Compose passes to the container. Next step: the app reads Secrets Manager directly with the AWS SDK (cached, re-fetched on auth failure, so rotation works).
+- **The pipeline never sees app secrets.** It only has short-lived OIDC credentials that can't read them.
+---
+`.gitlab-ci.yml` (abridged; full file in the repo)
+```yaml
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+
+stages: [test, build, deploy, verify]
+
+variables:
+  IMAGE: ${ECR_REGISTRY}/kerjaku-app:${CI_COMMIT_SHA}
+
+.aws_oidc:
+  id_tokens: { AWS_ID_TOKEN: { aud: sts.amazonaws.com } }
+  before_script:
+    - export AWS_WEB_IDENTITY_TOKEN_FILE="$(mktemp)"
+    - printf '%s' "$AWS_ID_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
+
+lint_and_unit_test:  { stage: test,  tags: [kerjaku-build], image: node:20.18-bookworm-slim, script: [npm ci, npm run lint, npm test, npm run migrations:check] }
+
+build_image:
+  stage: build
+  tags: [kerjaku-build]
+  extends: .aws_oidc
+  variables: { AWS_ROLE_ARN: arn:aws:iam::123456789012:role/gitlab-kerjaku-build }
+  script: [ecr login, skip if tag exists, docker build --pull -t $IMAGE ., docker push, block on CRITICAL CVEs]
+
+.deploy_base:
+  extends: .aws_oidc
+  tags: [kerjaku-deploy]          # protected runner
+  resource_group: production      # one deploy at a time
+  interruptible: false
+  variables: { AWS_ROLE_ARN: arn:aws:iam::123456789012:role/gitlab-kerjaku-deploy }
+
+migrate_database:
+  extends: .deploy_base
+  stage: deploy
+  environment: { name: production, action: prepare }
+  rules: [{ if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH, when: manual }]   # the "Deploy" button
+  allow_failure: false
+  script: ["./scripts/run-on-one-host.sh \"/usr/local/bin/kerjaku-host-deploy migrate '$IMAGE'\""]
+
+deploy_production:
+  extends: .deploy_base
+  stage: deploy
+  needs: [build_image, migrate_database]
+  environment: { name: production, url: https://kerjaku.example.com }
+  script: [./scripts/rolling-deploy.sh "$IMAGE"]
+
+verify_production:
+  stage: verify
+  needs: [deploy_production]
+  script: [curl /health, /, /jobs through the public URL; fail on non-200]
+
+rollback_production:
+  extends: .deploy_base
+  stage: deploy
+  environment: { name: production }
+  rules: [{ if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH, when: manual }]
+  variables: { RECORD_PREVIOUS: "false" }
+  script:
+    - PREVIOUS_IMAGE=$(aws ssm get-parameter --name /kerjaku/prod/previous_image --query Parameter.Value --output text)
+    - ./scripts/rolling-deploy.sh "$PREVIOUS_IMAGE"
+```
+---
