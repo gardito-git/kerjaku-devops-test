@@ -4,6 +4,7 @@
 
 A developer wrote this Terraform to move the web servers into an Auto Scaling Group. It is
 waiting for your review.
+
 ---
 ### File E - web.tf
 ```hcl
@@ -63,3 +64,26 @@ The team keeps Terraform state in a local terraform.tfstate file committed to Gi
 1. Write your code review: list each issue, its risk, and the fix. (8 pts)
 2. Rewrite the security group and Auto Scaling Group blocks the way you would merge them. (4 pts)
 3. What is wrong with how the team stores Terraform state, and what would you set up instead? (3 pts)
+
+## Answer
+### 1. Write your code review: list each issue, its risk, and the fix. (8 pts)
+- Issue
+
+  Hard-coded `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` in `user_data`
+  - Risk:
+    Critical. 
+    
+    The key is now in Git, in Terraform state, in the launch template (readable by anyone with `ec2:DescribeLaunchTemplateVersions`) and in instance user-data (readable from IMDS by any process on the box, including via SSRF). Long-lived, unrotated, probably over-privileged.
+    ```yaml
+    Deactivate and rotate the key today, and check CloudTrail for its use. Use an IAM instance profile with least-privilege permissions.
+    ```
+
+  SG ingress `0-65535` from `0.0.0.0/0`
+  - Risk:
+    Critical. 
+
+    Every port on every instance is open to the internet: SSH, :3000, the Docker API if ever enabled, node debug ports.
+    ```yaml
+    Ingress only port 80 from the ALB security group. No SSH (use SSM Session Manager).
+    ```
+    
