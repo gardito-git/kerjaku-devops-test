@@ -1,0 +1,194 @@
+# .gitlab-ci.yml — KerjaKu web app
+#
+# Flow (main branch):
+#   test ──► build (push :<sha> to ECR) ──► [▶ deploy: migrate] ──► deploy (rolling, 1 host at a time) ──► verify
+#                                                                            │ fails?  → that host auto-rolls back, pipeline red
+#   [▶ rollback] (manual, any time) ── redeploys the previous image in < 5 min, no rebuild
+#
+# Merge requests run test + build only. Nothing deploys from a feature branch.
+#
+# Assumptions
+#   - Runners are tagged `kerjaku-build` (ephemeral autoscaled VMs) and `kerjaku-deploy`
+#     (protected runner: only picks up jobs on protected branches/tags). See part2-pipeline/runner/.
+#   - AWS access is via GitLab OIDC (id_tokens) → IAM roles. There are NO AWS keys in CI/CD variables.
+#     The deploy role's trust policy only accepts tokens whose `sub` is
+#     project_path:kerjaku/web:ref_type:branch:ref:main.
+#   - `ci-tools` is our own small image in ECR with: aws-cli v2, docker cli, jq, curl.
+#   - App secrets never pass through the pipeline: web servers read them from Secrets Manager
+#     with their instance role.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+
+stages: [test, build, deploy, verify]
+
+variables:
+  AWS_REGION: ap-southeast-1
+  AWS_DEFAULT_REGION: ap-southeast-1
+  ECR_REGISTRY: 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com
+  IMAGE_REPO: ${ECR_REGISTRY}/kerjaku-app
+  IMAGE: ${IMAGE_REPO}:${CI_COMMIT_SHA}           # immutable tag = exact commit
+  CI_TOOLS_IMAGE: ${ECR_REGISTRY}/ci-tools:2026.10.1
+  TARGET_GROUP_ARN: arn:aws:elasticloadbalancing:ap-southeast-1:123456789012:targetgroup/kerjaku-web/0123456789abcdef
+  APP_URL: https://kerjaku.example.com
+
+include:
+  - template: Jobs/Secret-Detection.gitlab-ci.yml   # fail MRs that add keys/passwords to the repo
+
+default:
+  interruptible: true
+  retry:
+    max: 1
+    when: [runner_system_failure, stuck_or_timeout_failure]
+
+# ---------------------------------------------------------------- reusable: AWS creds via OIDC
+.aws_oidc:
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: sts.amazonaws.com
+  before_script:
+    # The AWS CLI/SDK assume AWS_ROLE_ARN automatically from a web-identity token file.
+    # Credentials last 1 hour and only exist for this job.
+    - export AWS_WEB_IDENTITY_TOKEN_FILE="$(mktemp)"
+    - printf '%s' "$AWS_ID_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
+    - export AWS_ROLE_SESSION_NAME="gitlab-${CI_PROJECT_ID}-${CI_JOB_ID}"
+    - aws sts get-caller-identity --query Arn --output text
+
+# ================================================================= test
+lint_and_unit_test:
+  stage: test
+  tags: [kerjaku-build]
+  image: node:20.18-bookworm-slim                    # pinned, not :latest
+  cache:
+    key:
+      files: [package-lock.json]
+    paths: [.npm/]
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm run lint
+    - npm test
+    - npm run migrations:check      # refuses DROP/RENAME in a migration unless labelled as a "contract" step (see Part 2 Q3)
+
+# ================================================================= build (once, in CI — never on a server)
+build_image:
+  stage: build
+  tags: [kerjaku-build]
+  extends: .aws_oidc
+  image: ${CI_TOOLS_IMAGE}
+  services:
+    - name: docker:27.3-dind
+      alias: docker
+  variables:
+    AWS_ROLE_ARN: arn:aws:iam::123456789012:role/gitlab-kerjaku-build   # ecr:Push on kerjaku-app only
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: /certs
+    DOCKER_CERT_PATH: /certs/client
+    DOCKER_TLS_VERIFY: "1"
+  script:
+    - aws ecr get-login-password | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+    # ECR tag immutability is ON, so a retried pipeline must not try to push the same tag again.
+    - |
+      if aws ecr describe-images --repository-name kerjaku-app --image-ids imageTag="$CI_COMMIT_SHA" >/dev/null 2>&1; then
+        echo "Image $IMAGE already exists, skipping build"
+      else
+        docker build --pull \
+          --label org.opencontainers.image.revision="$CI_COMMIT_SHA" \
+          --label org.opencontainers.image.source="$CI_PROJECT_URL" \
+          --build-arg APP_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}" \
+          -t "$IMAGE" .
+        docker push "$IMAGE"
+      fi
+    # Human-friendly alias for releases (v2.14.0). Deploys still reference the SHA.
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        docker pull "$IMAGE"
+        docker tag "$IMAGE" "${IMAGE_REPO}:${CI_COMMIT_TAG}"
+        docker push "${IMAGE_REPO}:${CI_COMMIT_TAG}"
+      fi
+    # ECR "scan on push" runs automatically; block the release on CRITICAL findings.
+    - aws ecr wait image-scan-complete --repository-name kerjaku-app --image-id imageTag="$CI_COMMIT_SHA"
+    - |
+      crit=$(aws ecr describe-image-scan-findings --repository-name kerjaku-app --image-id imageTag="$CI_COMMIT_SHA" \
+             --query 'imageScanFindings.findingSeverityCounts.CRITICAL' --output text)
+      if [ "$crit" != "None" ] && [ "$crit" -gt 0 ]; then echo "CRITICAL vulnerabilities: $crit"; exit 1; fi
+
+# ================================================================= deploy (production)
+.deploy_base:
+  extends: .aws_oidc
+  tags: [kerjaku-deploy]                 # protected runner, not on a web server
+  image: ${CI_TOOLS_IMAGE}
+  interruptible: false                   # never cancel a deploy half-way
+  resource_group: production             # only ONE deploy/rollback/migration at a time
+  variables:
+    AWS_ROLE_ARN: arn:aws:iam::123456789012:role/gitlab-kerjaku-deploy
+    # deploy role may only: ssm:SendCommand to instances tagged App=kerjaku, elbv2 (de)register on
+    # this target group, ssm:Get/PutParameter on /kerjaku/prod/*. No ECR push, no IAM, no RDS admin.
+
+# Step 1 of the release. This is the "Deploy" button developers press.
+# Runs DB migrations ONCE, using the NEW image, on one web server (which already has DB access via
+# its instance role). Migrations must be backward compatible with the version still running.
+migrate_database:
+  extends: .deploy_base
+  stage: deploy
+  environment:
+    name: production
+    action: prepare
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual                       # protected environment: only "Developers who can deploy" group
+  allow_failure: false                   # pipeline waits here until someone presses the button
+  script:
+    - ./scripts/run-on-one-host.sh "/usr/local/bin/kerjaku-host-deploy migrate '$IMAGE'"
+
+# Step 2: rolling deploy across the target group, one server at a time.
+deploy_production:
+  extends: .deploy_base
+  stage: deploy
+  needs: [build_image, migrate_database]
+  environment:
+    name: production
+    url: ${APP_URL}
+    action: start
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - ./scripts/rolling-deploy.sh "$IMAGE"
+
+# Step 3: smoke test through the real public path (DNS → ALB → Nginx → app).
+verify_production:
+  stage: verify
+  tags: [kerjaku-deploy]
+  image: ${CI_TOOLS_IMAGE}
+  needs: [deploy_production]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - |
+      for path in /health / /jobs; do
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${APP_URL}${path}")
+        echo "GET ${path} -> ${code}"
+        [ "$code" = "200" ] || exit 1
+      done
+
+# One-click rollback. Available on every main pipeline (and from Deployments → Environments →
+# production → "Rollback" on any earlier deployment, which re-runs that pipeline's deploy job).
+# Uses an image that is already in ECR and cached on the hosts: no build, no migration.
+rollback_production:
+  extends: .deploy_base
+  stage: deploy
+  environment:
+    name: production
+    action: start
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  allow_failure: true                    # don't block the pipeline on an optional job
+  variables:
+    RECORD_PREVIOUS: "false"             # keep previous_image pointing at the known-good build
+  script:
+    - PREVIOUS_IMAGE=$(aws ssm get-parameter --name /kerjaku/prod/previous_image --query Parameter.Value --output text)
+    - echo "Rolling back to ${PREVIOUS_IMAGE}"
+    - ./scripts/rolling-deploy.sh "$PREVIOUS_IMAGE"
