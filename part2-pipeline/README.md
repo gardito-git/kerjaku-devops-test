@@ -235,3 +235,18 @@ rollback_production:
     - ./scripts/rolling-deploy.sh "$PREVIOUS_IMAGE"
 ```
 ---
+### 4. Developers want to deploy on their own, any time. 
+
+What guardrails would you put in place so they can do this safely? Name at least three. (3 pts)
+
+---
+1. **Only tested, reviewed code can reach production.** `main` is protected: MR + 1 approval + green pipeline (lint, tests, secret detection, image scan, migration check). Deploys run only from `main` on a protected runner. A feature branch physically can't deploy.
+2. **Automatic health gating + auto-rollback.** The rolling deploy checks each host (`post-deploy-check.sh` + ALB health) before touching the next one, and rolls the failed host back automatically. A bad release costs one host for a minute, not the site for 40 minutes.
+3. **One-click rollback that anyone in the deployers group can press**, documented in a 5-line runbook. Rolling back is never a reason to wait for a senior.
+4. **Serialized deploys** (`resource_group: production`), so two developers can't deploy over each other.
+5. **Backward-compatible migrations enforced in CI** (the expand/contract rule + `migrations:check` + an extra approval for destructive changes).
+6. **Deploy windows:** GitLab *Deploy freezes* (e.g. Friday 17:00 → Monday 09:00 WIB, public holidays in ID/MY). Outside them, deploys need a second person's approval on the protected environment.
+7. **Visibility:** every deploy posts to Slack (who, what commit, link) and adds a deploy marker on the CloudWatch/Grafana dashboard. 5xx and latency alerts for 15 minutes after a deploy go to the person who deployed.
+8. **Feature flags** for risky features: ship dark, turn on gradually, turn off without a deploy.
+
+---
