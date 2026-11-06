@@ -69,7 +69,7 @@ The team keeps Terraform state in a local terraform.tfstate file committed to Gi
 ### 1. Write your code review: list each issue, its risk, and the fix. (8 pts)
 - Issue
 
-  Hard-coded `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` in `user_data`
+  1. Hard-coded `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` in `user_data`
   - Risk:
     Critical. 
     
@@ -78,7 +78,7 @@ The team keeps Terraform state in a local terraform.tfstate file committed to Gi
     Deactivate and rotate the key today, and check CloudTrail for its use. Use an IAM instance profile with least-privilege permissions.
     ```
 
-  SG ingress `0-65535` from `0.0.0.0/0`
+  2. SG ingress `0-65535` from `0.0.0.0/0`
   - Risk:
     Critical. 
 
@@ -86,4 +86,12 @@ The team keeps Terraform state in a local terraform.tfstate file committed to Gi
     ```yaml
     Ingress only port 80 from the ALB security group. No SSH (use SSM Session Manager).
     ```
-    
+
+  3. docker run … kerjaku-app:latest with a local image name
+  - Risk:
+    Critical. 
+
+    A fresh instance has no image called `kerjaku-app:latest` (it was only ever built locally on the old servers), so every instance the ASG launches will fail to start the app. The `.env` it just downloaded isn't even passed (`--env-file` missing). No restart policy, `0.0.0.0:3000`, and `latest` means no version control.
+    ```yaml
+    Pull a specific ECR:<sha> (from SSM Parameter /kerjaku/prod/current_image) and start it with the same script the pipeline uses (kerjaku-host-deploy).
+    ```
