@@ -102,27 +102,27 @@ File A:
 
 File B:
 - Critical
-- Issue
+  - Issue
 
-SG allows 22 from 0.0.0.0/0, with PermitRootLogin yes, PasswordAuthentication yes and MaxAuthTries 10
-```yaml
-Internet-wide password brute force against root. One guessed password means full control of production.
-```
+    SG allows 22 from 0.0.0.0/0, with PermitRootLogin yes, PasswordAuthentication yes and MaxAuthTries 10
+    ```yaml
+    Internet-wide password brute force against root. One guessed password means full control of production.
+    ```
 - High
-- Issue
+  - Issue
 
-PermitRootLogin yes
-```yaml
-No per-person attribution, and root compromise is immediate. Use named accounts with sudo. Even better, use SSM Session Manager.
-```
-PasswordAuthentication yes
-```yaml
-Passwords can be guessed, phished or reused. Keys (or SSM) only.
-```
-- Medium
-- Issue
+    PermitRootLogin yes
+    ```yaml
+    No per-person attribution, and root compromise is immediate. Use named accounts with sudo. Even better, use SSM Session Manager.
+    ```
+    PasswordAuthentication yes
+    ```yaml
+    Passwords can be guessed, phished or reused. Keys (or SSM) only.
+    ```
+  - Medium
+    - Issue
 
-MaxAuthTries 10
-```yaml
-10 guesses per connection makes brute force 3–5× faster. Use 3.
-```
+    MaxAuthTries 10
+    ```yaml
+    10 guesses per connection makes brute force 3–5× faster. Use 3.
+    ```
