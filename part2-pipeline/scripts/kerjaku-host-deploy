@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# /usr/local/bin/kerjaku-host-deploy — installed on every web server (baked into the AMI).
+# Called by the pipeline through SSM Run Command, and by EC2 user_data at boot.
+#
+#   kerjaku-host-deploy deploy IMAGE   pull IMAGE, refresh secrets, switch container, run post-deploy-check
+#   kerjaku-host-deploy rollback       switch back to the image recorded in release.env.previous
+#   kerjaku-host-deploy migrate IMAGE  run DB migrations once using IMAGE
+#
+# Secrets come from AWS Secrets Manager using the instance role (no keys on disk, nothing in git).
+
+set -Eeuo pipefail
+umask 077
+
+AWS_REGION=${AWS_REGION:-ap-southeast-1}
+ECR_REGISTRY=${ECR_REGISTRY:-123456789012.dkr.ecr.${AWS_REGION}.amazonaws.com}
+SECRET_ID=${SECRET_ID:-kerjaku/prod/app}
+CONF_DIR=/etc/kerjaku
+RELEASE_FILE=${CONF_DIR}/release.env
+SECRETS_FILE=${CONF_DIR}/kerjaku.env
+COMPOSE=(docker compose -f /opt/kerjaku/compose.yml --env-file "$RELEASE_FILE")
+
+log() { printf '%s [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "${*:2}"; }
+trap 'log ERROR "failed at line $LINENO"' ERR
+
+ecr_login() {
+  aws ecr get-login-password --region "$AWS_REGION" \
+    | docker login --username AWS --password-stdin "$ECR_REGISTRY" >/dev/null
+}
+
+# Write Secrets Manager JSON {"DB_PASSWORD":"..."} as KEY=value lines, root-only, atomically.
+refresh_secrets() {
+  local tmp
+  tmp=$(mktemp "${CONF_DIR}/.kerjaku.env.XXXXXX")
+  aws secretsmanager get-secret-value --region "$AWS_REGION" --secret-id "$SECRET_ID" \
+      --query SecretString --output text \
+    | jq -r 'to_entries[] | "\(.key)=\(.value)"' > "$tmp"
+  [[ -s "$tmp" ]] || { rm -f "$tmp"; log ERROR "secret ${SECRET_ID} is empty"; return 1; }
+  mv "$tmp" "$SECRETS_FILE"
+}
+
+switch_to() {
+  local image=$1
+  printf 'KERJAKU_IMAGE=%s\n' "$image" > "${RELEASE_FILE}.tmp"
+  mv "${RELEASE_FILE}.tmp" "$RELEASE_FILE"
+  # --wait blocks until the container's Docker healthcheck is healthy (or fails after the timeout).
+  "${COMPOSE[@]}" up -d --force-recreate --wait --wait-timeout 120
+}
+
+case "${1:-}" in
+  deploy)
+    image=${2:?usage: deploy IMAGE}
+    log INFO "pulling ${image}"
+    ecr_login
+    docker pull --quiet "$image"
+    refresh_secrets
+    if [[ -f "$RELEASE_FILE" ]] && ! grep -qx "KERJAKU_IMAGE=${image}" "$RELEASE_FILE"; then
+      cp "$RELEASE_FILE" "${RELEASE_FILE}.previous"
+    fi
+    switch_to "$image"
+    /usr/local/bin/post-deploy-check.sh
+    # Keep the last few images locally for instant rollback; prune older ones.
+    docker image prune -af --filter "until=168h" >/dev/null || true
+    log INFO "deployed ${image}"
+    ;;
+  rollback)
+    [[ -f "${RELEASE_FILE}.previous" ]] || { log ERROR "no previous release recorded"; exit 1; }
+    # shellcheck disable=SC1090
+    previous=$(. "${RELEASE_FILE}.previous"; echo "$KERJAKU_IMAGE")
+    log INFO "rolling back to ${previous}"
+    switch_to "$previous"
+    /usr/local/bin/post-deploy-check.sh
+    ;;
+  migrate)
+    image=${2:?usage: migrate IMAGE}
+    ecr_login
+    docker pull --quiet "$image"
+    refresh_secrets
+    log INFO "running migrations from ${image}"
+    # The migration tool takes a lock in the DB, so an accidental second run waits instead of colliding.
+    docker run --rm --env-file "$SECRETS_FILE" -e NODE_ENV=production "$image" npm run migrate
+    ;;
+  *)
+    echo "usage: $0 {deploy IMAGE|rollback|migrate IMAGE}" >&2
+    exit 2
+    ;;
+esac
