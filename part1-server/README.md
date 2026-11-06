@@ -280,3 +280,12 @@ Why this choice:
 - **No secrets on the command line.** Docker reads them from a root-only file at container creation. The file is generated from **AWS Secrets Manager** by the deploy script using the instance role (no keys on disk; see Part 6). Remaining trade-off: root on the host can still see them via `docker inspect`. The final step is for the app to read Secrets Manager directly at startup with the AWS SDK, so nothing is written to disk.
 - **No bind mount of the source tree.** The image *is* the release. **Pinned image tag** (git SHA) gives rollback by changing one line.
 - **Memory limit and healthcheck**: a bad release kills only its own container, and `docker compose up --wait` fails fast if the app never gets healthy.
+
+### 4. How would you stop `/var/log` filling up again? (3 pts)
+1. **Find out what is actually growing** (`du -xh /var/log | sort -h | tail`, `journalctl --disk-usage`). It's usually Nginx access logs (including ALB health checks every few seconds), the journal, or app logs written to a file.
+2. **Rotate by size, not only by day:** [`part1-server/logs/logrotate-nginx`](part1-server/logs/logrotate-nginx) uses `daily` + `maxsize 100M`, `rotate 7`, `compress`, and moves the logrotate timer to **hourly** (otherwise `maxsize` is only checked once a day).
+3. **Cap the journal:** [`journald-kerjaku.conf`](part1-server/logs/journald-kerjaku.conf) sets `SystemMaxUse=500M`, `SystemKeepFree=2G`.
+4. **Cap Docker container logs** (they live in `/var/lib/docker`, same disk): [`docker-daemon.json`](part1-server/logs/docker-daemon.json) sets `max-size 50m × 5 files`.
+5. **Reduce noise:** `access_log off` for health checks; the app logs at `info`, not `debug`, in production.
+6. **Ship logs off the box** with the CloudWatch agent (or Fluent Bit) to CloudWatch Logs with a retention policy (e.g. 30 days hot, then export to S3/Glacier). Local disk then only needs a few days of logs, and logs survive instance replacement (which matters once we use an ASG).
+7. **Isolate and alert:** mount `/var/log` on its own EBS volume (or at least alert before it's full) so logs can never fill `/`. Add a CloudWatch alarm on `disk_used_percent > 80%` from the CloudWatch agent, which pages *before* the outage, not after.
