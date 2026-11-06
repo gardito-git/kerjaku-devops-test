@@ -1,0 +1,33 @@
+# /etc/gitlab-runner/config.toml on the DEPLOY runner (dedicated t3.small in a private subnet)
+#
+# Registered in GitLab as a PROJECT runner for kerjaku/web only.
+# Registration settings (GitLab UI):
+#   tags: kerjaku-deploy      run untagged jobs: NO      protected: YES  (only main / v* tags)
+#   locked to project: YES
+#
+# This runner never builds anything and never runs code from a merge request. Its jobs only call
+# AWS APIs (ELB, SSM Run Command, SSM Parameter Store) using short-lived credentials from
+# GitLab OIDC → role `gitlab-kerjaku-deploy`, whose trust policy only accepts
+# sub = project_path:kerjaku/web:ref_type:branch:ref:main (and the release tag pattern).
+# The instance itself has an IAM role with NO permissions beyond SSM agent registration.
+
+concurrent = 1                       # deploys are serialised anyway (resource_group)
+check_interval = 3
+
+[[runners]]
+  name = "kerjaku-deploy"
+  url = "https://gitlab.kerjaku.example.com"
+  token = "glrt-REDACTED"
+  executor = "docker"
+
+  [runners.docker]
+    image = "123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/ci-tools:2026.10.1"
+    privileged = false
+    volumes = []                     # no docker.sock, no /root/.ssh, no shared host dirs
+    allowed_images = ["123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/ci-tools:*"]
+    allowed_pull_policies = ["always"]
+    cap_drop = ["ALL"]
+    security_opt = ["no-new-privileges:true"]
+    disable_cache = true
+    memory = "1g"
+    cpus = "1"
