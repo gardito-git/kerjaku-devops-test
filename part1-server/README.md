@@ -119,8 +119,8 @@ File B:
     ```yaml
     Passwords can be guessed, phished or reused. Keys (or SSM) only.
     ```
-  - Medium
-    - Issue
+- Medium
+  - Issue
 
     MaxAuthTries 10
     ```yaml
