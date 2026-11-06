@@ -54,75 +54,117 @@ File A:
 - Critical
   - Issue
 
-  `location ~ /\.env { allow all; }`
-  ```yaml
-  Regex locations win over `location /`, and this block has no `proxy_pass`, so Nginx serves `/var/www/kerjaku/.env` from `root` as a static file. Anyone can download the production secrets with `GET /.env`. The regex isn't anchored either, so `/anything/.env.bak` matches too.
-  ```
+    `location ~ /\.env { allow all; }`
+    ```yaml
+    Regex locations win over `location /`, and this block has no `proxy_pass`, so Nginx serves `/var/www/kerjaku/.env` from `root` as a static file. Anyone can download the production secrets with `GET /.env`. The regex isn't anchored either, so `/anything/.env.bak` matches too.
+    ```
 - High
   - Issue
 
-  `autoindex on` + `root /var/www/kerjaku` (the app's source directory)
-  ```yaml
-  Any path that falls through to static serving lists directory contents. `root` points at a directory that holds `.env`, `.git` and source code, so a single mistake in a location block exposes them.
-  ```
-  `location /uploads` serves CVs straight from local disk
-  ```yaml
-  CVs contain personal data (names, phone numbers, addresses) and are public to anyone who guesses or enumerates a filename. They can't be revoked and need no auth. Combined with `autoindex on`, the whole directory can be **listed**. There are also two servers with separate disks, so a file uploaded on web-1 returns 404 on web-2. Uploads should live in S3 (as the architecture says) and be served via short-lived pre-signed URLs after an authorization check. Uploaded HTML/SVG served from the main origin is also a stored-XSS vector.
-  ```
+    `autoindex on` + `root /var/www/kerjaku` (the app's source directory)
+    ```yaml
+    Any path that falls through to static serving lists directory contents. `root` points at a directory that holds `.env`, `.git` and source code, so a single mistake in a location block exposes them.
+    ```
+    `location /uploads` serves CVs straight from local disk
+    ```yaml
+    CVs contain personal data (names, phone numbers, addresses) and are public to anyone who guesses or enumerates a filename. They can't be revoked and need no auth. Combined with `autoindex on`, the whole directory can be **listed**. There are also two servers with separate disks, so a file uploaded on web-1 returns 404 on web-2. Uploads should live in S3 (as the architecture says) and be served via short-lived pre-signed URLs after an authorization check. Uploaded HTML/SVG served from the main origin is also a stored-XSS vector.
+    ```
 - Medium
   - Issue
 
-  No `X-Forwarded-For` / `X-Forwarded-Proto` / `Host` headers sent to the app; no `real_ip` configuration
-  ```yaml
-  The app sees every user as `127.0.0.1` and every request as plain HTTP. Effects: rate limiting and audit logs are useless, "secure" cookies and redirects to `http://` break, and there may be redirect loops.
-  ```
-  `client_max_body_size 500M`
-  ```yaml
-  CVs are a few MB. 500 MB lets a single client tie up workers and fill `/var/lib/nginx` and the disk.
-  ```
-  `location /uploads` without trailing slashes
-  ```yaml
-  The prefix also matches `/uploads-old`, `/uploads.bak` and so on, which map to sibling directories next to `uploads`. Use `location /uploads/ { alias …/uploads/; }` if this is kept at all.
-  ```
-  No `keepalive_timeout` tuned for the ALB, no proxy timeouts
-  ```yaml
-  Nginx's default keep-alive (75 s) happens to be fine, but if it's ever set below the ALB idle timeout (60 s) the ALB will reuse closed connections and return intermittent 502s. No `proxy_read_timeout` means slow requests behave unpredictably.
-  ```
+    No `X-Forwarded-For` / `X-Forwarded-Proto` / `Host` headers sent to the app; no `real_ip` configuration
+    ```yaml
+    The app sees every user as `127.0.0.1` and every request as plain HTTP. Effects: rate limiting and audit logs are useless, "secure" cookies and redirects to `http://` break, and there may be redirect loops.
+    ```
+    `client_max_body_size 500M`
+    ```yaml
+    CVs are a few MB. 500 MB lets a single client tie up workers and fill `/var/lib/nginx` and the disk.
+    ```
+    `location /uploads` without trailing slashes
+    ```yaml
+    The prefix also matches `/uploads-old`, `/uploads.bak` and so on, which map to sibling directories next to `uploads`. Use `location /uploads/ { alias …/uploads/; }` if this is kept at all.
+    ```
+    No `keepalive_timeout` tuned for the ALB, no proxy timeouts
+    ```yaml
+    Nginx's default keep-alive (75 s) happens to be fine, but if it's ever set below the ALB idle timeout (60 s) the ALB will reuse closed connections and return intermittent 502s. No `proxy_read_timeout` means slow requests behave unpredictably.
+    ```
 - Low
   - Issue
 
-  No security headers (HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`), and `server_tokens` is on
-  ```yaml
-  Defence in depth against clickjacking, MIME sniffing and version fingerprinting.
-  ```
-  Only one `server` block, no `default_server`
-  ```yaml
-  Requests with any `Host` header are proxied to the app (host-header attacks, scanner noise in app logs).
-  ```
+    No security headers (HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`), and `server_tokens` is on
+    ```yaml
+    Defence in depth against clickjacking, MIME sniffing and version fingerprinting.
+    ```
+    Only one `server` block, no `default_server`
+    ```yaml
+    Requests with any `Host` header are proxied to the app (host-header attacks, scanner noise in app logs).
+    ```
 
 File B:
 - Critical
   - Issue
 
-    SG allows 22 from 0.0.0.0/0, with PermitRootLogin yes, PasswordAuthentication yes and MaxAuthTries 10
+    SG allows 22 from `0.0.0.0/0`, with `PermitRootLogin yes`, `PasswordAuthentication yes` and `MaxAuthTries 10`
     ```yaml
     Internet-wide password brute force against root. One guessed password means full control of production.
     ```
 - High
   - Issue
 
-    PermitRootLogin yes
+    `PermitRootLogin yes`
     ```yaml
     No per-person attribution, and root compromise is immediate. Use named accounts with sudo. Even better, use SSM Session Manager.
     ```
-    PasswordAuthentication yes
+    `PasswordAuthentication yes`
     ```yaml
     Passwords can be guessed, phished or reused. Keys (or SSM) only.
     ```
 - Medium
   - Issue
 
-    MaxAuthTries 10
+    `MaxAuthTries 10`
     ```yaml
     10 guesses per connection makes brute force 3–5× faster. Use 3.
+    ```
+
+File C:
+- Critical
+  - Issue
+
+    SG allows 3000 from 0.0.0.0/0 and Docker publishes `0.0.0.0:3000`
+    ```yaml
+    The app is reachable directly from the internet, bypassing the ALB, TLS, Nginx and any WAF. Docker's iptables rules also bypass ufw, so a host firewall wouldn't help.
+    ```
+    `-e DB_PASSWORD=Kerja2024!` on the command line
+    ```yaml
+    The secret is visible in ps, /proc/*/cmdline, docker inspect, shell history and rc.local itself, which is world-readable by default. The password is weak, and the same value is shared in chat.
+    ```
+- High
+  - Issue
+
+    Started from `/etc/rc.local` with no `--name` and no restart policy
+    ```yaml
+    If the app crashes it stays down until someone notices. On reboot rc.local runs docker run again and creates a second unnamed container, while the old stopped one stays around. Also, the pipeline (D1) does docker stop kerjaku, which doesn't match this unnamed container. Two different start methods give unpredictable state.
+    ```
+    `-v /var/www/kerjaku:/app` bind-mounts the host source tree over the image
+    ```yaml
+    What runs is whatever is on disk (git pull result + host node_modules), not the tested image. That breaks reproducibility and rollback, and gives the container write access to the host code and .env.
+    ```
+- Medium
+  - Issue
+
+    `kerjaku-app:latest` tag
+    ```yaml
+    You can't tell which version is running, can't roll back to "the previous latest", and the two servers can silently run different code.
+    ```
+    No memory/CPU limit on the container
+    ```
+    A memory-hungry release drags the whole host into the kernel OOM killer (exactly what happens in Part 4).
+    ```
+- Low
+  - Issue
+
+    `sudo` inside `rc.local` (already root), and the container probably runs as root
+    ```yaml
+    Messy and misleading. The container should run as a non-root user with a read-only filesystem.
     ```
