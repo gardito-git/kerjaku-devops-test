@@ -1,0 +1,62 @@
+# /opt/kerjaku/compose.yml  — replaces the `docker run` line in /etc/rc.local
+#
+# Start / update:   docker compose -f /opt/kerjaku/compose.yml --env-file /etc/kerjaku/release.env up -d --wait
+#
+# - Restart on failure AND on reboot: `restart: unless-stopped` + docker.service enabled in systemd.
+#   (Docker re-creates the container at boot from its stored config; rc.local is no longer used.)
+# - No secrets on the command line: they are read from /etc/kerjaku/kerjaku.env (root:root 0600),
+#   which is written from AWS Secrets Manager by kerjaku-host-deploy (see part2-pipeline/scripts).
+# - /etc/kerjaku/release.env holds only the image reference, e.g.
+#       KERJAKU_IMAGE=123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/kerjaku-app:3f9c2ab
+#   so every server runs an exact, immutable image and rollback = put back the previous line.
+
+name: kerjaku
+
+services:
+  app:
+    image: ${KERJAKU_IMAGE:?KERJAKU_IMAGE must be set in /etc/kerjaku/release.env}
+    container_name: kerjaku
+    restart: unless-stopped
+    init: true                      # proper PID 1: forwards SIGTERM, reaps zombies
+    stop_grace_period: 30s          # let in-flight requests finish
+
+    ports:
+      - "127.0.0.1:3000:3000"       # only Nginx on the same host can reach the app
+
+    env_file:
+      - /etc/kerjaku/kerjaku.env    # DB_PASSWORD etc. — never on the command line or in `ps`
+    environment:
+      NODE_ENV: production
+      # Keep V8's heap below the container limit so we get a clear JS "heap out of memory"
+      # error in the app log instead of a silent kernel OOM kill (see Part 4).
+      NODE_OPTIONS: --max-old-space-size=2560
+
+    # Resource limits: a leaking/greedy app is killed inside its own cgroup and restarted,
+    # instead of the kernel OOM-killer picking processes across the whole host.
+    mem_limit: 3g
+    memswap_limit: 3g
+    cpus: 1.8
+
+    # Hardening: no source-code bind mount any more (the image IS the release), read-only
+    # root filesystem, non-root user, no extra privileges.
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "node"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
+
+    # Cap container logs so Docker can't fill the disk. (The CloudWatch agent ships them off-box.)
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

@@ -1,0 +1,26 @@
+# /etc/logrotate.d/nginx
+# Rotate daily OR as soon as a file passes 100 MB (requires logrotate to run hourly — see
+# the systemd timer override below), keep 7 compressed copies locally. Long-term retention
+# lives in CloudWatch Logs, not on the server's disk.
+/var/log/nginx/*.log {
+    daily
+    maxsize 100M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    dateext
+    dateformat -%Y%m%d-%H%M%S
+    create 0640 www-data adm
+    sharedscripts
+    postrotate
+        [ -s /run/nginx.pid ] && kill -USR1 "$(cat /run/nginx.pid)"
+    endscript
+}
+
+# /etc/systemd/system/logrotate.timer.d/hourly.conf
+# [Timer]
+# OnCalendar=
+# OnCalendar=hourly
+# AccuracySec=1m
