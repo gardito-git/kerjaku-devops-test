@@ -178,3 +178,21 @@ resource "aws_autoscaling_policy" "web_cpu" {
 ```
 
 The ALB security group must also allow egress to the web SG on port 80, and the RDS SG must allow 3306 from the web SG. Both live outside this file.
+
+### 3. What is wrong with how the team stores Terraform state, and what would you set up instead? (3 pts)
+**What's wrong:**
+
+- **Secrets in plain text.** State stores every attribute, including the hard-coded access key in `user_data`, any generated DB passwords and private keys. Everyone with repo access (and every clone, fork and laptop, forever, via Git history) has them.
+- **No locking.** Two people running `apply` at once both write state, and one overwrites the other, giving a corrupted or lost state.
+- **Stale state.** If someone applies without pulling first, Terraform plans against an old view of the world and can **destroy or duplicate** real resources. Merge conflicts in a JSON state file are effectively unresolvable.
+- **No reliable history or recovery** beyond Git, and anyone can edit it.
+
+**What I'd set up:**
+
+1. **S3 backend:** a dedicated bucket `kerjaku-terraform-state` with **versioning** (recover from bad writes), **SSE-KMS** encryption, **Block Public Access**, TLS-only bucket policy, and access limited to the CI apply role + 1–2 admins (break-glass). Optionally a separate AWS account for state.
+2. **Locking:** S3-native locking (`use_lockfile = true`, Terraform ≥ 1.10), or a DynamoDB lock table on older versions.
+3. **One state per environment/component** (`prod/web`, `prod/network`, `staging/web`) to limit blast radius.
+4. **Migration:** add the backend block, run `terraform init -migrate-state`, check `terraform plan` shows no changes, then `git rm --cached terraform.tfstate*` and add `*.tfstate*` and `.terraform/` to `.gitignore`. **Purge the files from Git history** (`git filter-repo`) and **rotate every secret that was in them**. Removing them from history doesn't un-leak them.
+5. **Workflow:** `terraform plan` runs in the MR pipeline and posts the plan. `apply` runs only from `main` in CI with an OIDC role. Humans don't apply from laptops.
+
+Config: [`part3-terraform/versions.tf`](part3-terraform/versions.tf).
