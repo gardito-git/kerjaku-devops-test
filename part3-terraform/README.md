@@ -86,3 +86,95 @@ The team keeps Terraform state in a local terraform.tfstate file committed to Gi
 | 15 | **SG with fixed `name`**, no `create_before_destroy` | **Low.** Any change that forces replacement fails ("name already exists") or detaches the SG from running instances. | `name_prefix` + `create_before_destroy`. |
 | 16 | **No EBS encryption, no detailed monitoring, no tags**; no provider/version pinning | **Low.** Compliance gaps (CV data = PII), no cost allocation, and provider upgrades can change behaviour. | `encrypted = true`, gp3, tags via `default_tags`, `required_providers` pinned. |
 | 17 | **State committed to Git** (see 3.3) | **Critical.** | S3 backend with locking. |
+
+### 2. Rewrite the security group and Auto Scaling Group blocks the way you would merge them. (4 pts)
+Full file (also includes the fixed launch template, IAM role and scaling policy): [`part3-terraform/web.tf`](part3-terraform/web.tf). `terraform init -backend=false && terraform validate` passes.
+
+```hcl
+resource "aws_security_group" "web" {
+  name_prefix = "kerjaku-web-"
+  description = "KerjaKu web servers: HTTP from ALB only"
+  vpc_id      = var.vpc_id
+  tags        = { Name = "kerjaku-web" }
+  lifecycle { create_before_destroy = true }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "web_http_from_alb" {
+  security_group_id            = aws_security_group.web.id
+  description                  = "Nginx from the ALB only"
+  ip_protocol                  = "tcp"
+  from_port                    = 80
+  to_port                      = 80
+  referenced_security_group_id = var.alb_security_group_id
+}
+
+resource "aws_vpc_security_group_egress_rule" "web_https_out" {
+  security_group_id = aws_security_group.web.id
+  description       = "HTTPS to AWS APIs and third-party APIs"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
+resource "aws_vpc_security_group_egress_rule" "web_mysql_out" {
+  security_group_id            = aws_security_group.web.id
+  description                  = "MySQL to RDS only"
+  ip_protocol                  = "tcp"
+  from_port                    = 3306
+  to_port                      = 3306
+  referenced_security_group_id = var.rds_security_group_id
+}
+
+resource "aws_autoscaling_group" "web" {
+  name_prefix         = "kerjaku-web-"
+  min_size            = 2
+  max_size            = 6
+  vpc_zone_identifier = var.private_subnet_ids        # >= 2 AZs, validated in variables.tf
+  target_group_arns   = [var.alb_target_group_arn]
+  # desired_capacity not set: starts at min_size, then the scaling policy owns it
+
+  health_check_type         = "ELB"
+  health_check_grace_period = 180
+  default_instance_warmup   = 180
+  wait_for_capacity_timeout = "15m"
+
+  launch_template {
+    id      = aws_launch_template.web.id
+    version = aws_launch_template.web.latest_version
+  }
+
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 100
+      max_healthy_percentage = 200
+      instance_warmup        = 180
+      auto_rollback          = true
+    }
+  }
+
+  enabled_metrics = ["GroupDesiredCapacity", "GroupInServiceInstances", "GroupPendingInstances",
+                     "GroupTerminatingInstances", "GroupTotalInstances"]
+
+  tag {
+    key                 = "Name"
+    value               = "kerjaku-web"
+    propagate_at_launch = true
+  }
+
+  lifecycle { create_before_destroy = true }
+}
+
+resource "aws_autoscaling_policy" "web_cpu" {
+  name                   = "kerjaku-web-cpu-target"
+  autoscaling_group_name = aws_autoscaling_group.web.name
+  policy_type            = "TargetTrackingScaling"
+  target_tracking_configuration {
+    predefined_metric_specification { predefined_metric_type = "ASGAverageCPUUtilization" }
+    target_value = 55
+  }
+}
+```
+
+The ALB security group must also allow egress to the web SG on port 80, and the RDS SG must allow 3306 from the web SG. Both live outside this file.
