@@ -67,31 +67,22 @@ The team keeps Terraform state in a local terraform.tfstate file committed to Gi
 
 ## Answer
 ### 1. Write your code review: list each issue, its risk, and the fix. (8 pts)
-- Issue
-
-  1. Hard-coded `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` in `user_data`
-  - Risk:
-    Critical. 
-    
-    The key is now in Git, in Terraform state, in the launch template (readable by anyone with `ec2:DescribeLaunchTemplateVersions`) and in instance user-data (readable from IMDS by any process on the box, including via SSRF). Long-lived, unrotated, probably over-privileged.
-    ```yaml
-    Deactivate and rotate the key today, and check CloudTrail for its use. Use an IAM instance profile with least-privilege permissions.
-    ```
-
-  2. SG ingress `0-65535` from `0.0.0.0/0`
-  - Risk:
-    Critical. 
-
-    Every port on every instance is open to the internet: SSH, :3000, the Docker API if ever enabled, node debug ports.
-    ```yaml
-    Ingress only port 80 from the ALB security group. No SSH (use SSM Session Manager).
-    ```
-
-  3. docker run … kerjaku-app:latest with a local image name
-  - Risk:
-    Critical. 
-
-    A fresh instance has no image called `kerjaku-app:latest` (it was only ever built locally on the old servers), so every instance the ASG launches will fail to start the app. The `.env` it just downloaded isn't even passed (`--env-file` missing). No restart policy, `0.0.0.0:3000`, and `latest` means no version control.
-    ```yaml
-    Pull a specific ECR:<sha> (from SSM Parameter /kerjaku/prod/current_image) and start it with the same script the pipeline uses (kerjaku-host-deploy).
-    ```
+| # | Issue | Risk | Fix |
+|---|---|---|---|
+| 1 | **Hard-coded `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` in `user_data`** | **Critical.** The key is now in Git, in Terraform state, in the launch template (readable by anyone with `ec2:DescribeLaunchTemplateVersions`) and in instance user-data (readable from IMDS by *any process on the box*, including via SSRF). Long-lived, unrotated, probably over-privileged. | **Deactivate and rotate the key today**, and check CloudTrail for its use. Use an **IAM instance profile** with least-privilege permissions. |
+| 2 | **SG ingress `0-65535` from `0.0.0.0/0`** | **Critical.** Every port on every instance is open to the internet: SSH, :3000, the Docker API if ever enabled, node debug ports. | Ingress **only port 80 from the ALB security group**. No SSH (use SSM Session Manager). |
+| 3 | **`docker run … kerjaku-app:latest` with a local image name** | **Critical.** A fresh instance has no image called `kerjaku-app:latest` (it was only ever built locally on the old servers), so **every instance the ASG launches will fail to start the app**. The `.env` it just downloaded isn't even passed (`--env-file` missing). No restart policy, `0.0.0.0:3000`, and `latest` means no version control. | Pull a specific `ECR:<sha>` (from SSM Parameter `/kerjaku/prod/current_image`) and start it with the same script the pipeline uses (`kerjaku-host-deploy`). |
+| 4 | **`vpc_zone_identifier = [var.public_subnet_a]`** | **High.** One AZ means an AZ outage takes the whole site down. A public subnet means instances may get public IPs and sit directly on the internet. | **Private subnets in ≥ 2 AZs.** Only the ALB is public. |
+| 5 | **`min_size = 1`, `desired_capacity = 1`** | **High.** Less capacity than today (2), a single point of failure, and any instance refresh or replacement is an outage. | `min_size = 2`. Don't set `desired_capacity` (or `ignore_changes`) so `terraform apply` doesn't fight the autoscaler. |
+| 6 | **`health_check_type = "EC2"`** | **High.** The ASG only replaces instances whose *VM* fails. An instance whose app is crash-looping (Part 4) stays in service forever. | `health_check_type = "ELB"` + `health_check_grace_period = 180`, with the ALB health check on `/health`. |
+| 7 | **`key_name = "shared-team-key"`** | **High.** One private key shared by everyone: no attribution, and it can't be revoked when someone leaves (Part 6). | Remove it. Use **SSM Session Manager** (IAM-based, per user, logged). |
+| 8 | **IMDSv1 allowed** (no `metadata_options`) | **High.** An SSRF bug in the app can read instance-role credentials. | `http_tokens = "required"` (IMDSv2), `hop_limit = 2` for containers. |
+| 9 | **`.env` file copied from S3** | **Medium.** Secrets in a file in a bucket (versioned copies, broad `s3:GetObject`), no rotation, no audit per secret. | Secrets Manager + instance role (Part 6). |
+| 10 | **`version = "$Latest"`** with no rollout strategy | **Medium.** A launch template change only affects *new* instances, silently. The fleet ends up running mixed versions with no controlled rollout or rollback. | `version = aws_launch_template.web.latest_version` + an **`instance_refresh`** block (rolling, `min_healthy_percentage = 100`, `auto_rollback = true`). |
+| 11 | **`max_size = 10` but no scaling policy** | **Medium.** It never scales. `max_size` is meaningless. | Target-tracking policy (CPU ~55% or ALB requests per target). |
+| 12 | **Egress all ports/protocols to `0.0.0.0/0`** | **Medium.** A compromised box can talk to anything (exfiltration, crypto-mining pools). | 443 out (AWS APIs, third-party APIs) and 3306 to the RDS SG only. |
+| 13 | **Hard-coded AMI ID**, no explanation of what's on it | **Medium.** Nobody knows what's in it or how to rebuild it. It may lack Docker. | Golden AMI built by **Packer** in CI (Docker, compose, SSM + CloudWatch agents, deploy scripts), passed in as a validated variable. |
+| 14 | **`t3.medium` (4 GB)** | **Medium.** This is the size that just OOMed in Part 4. t3 is also burstable, so CPU credits can run out under sustained load. | `t3.large` (or non-burstable `m6i.large`), the same for every instance. |
+| 15 | **SG with fixed `name`**, no `create_before_destroy` | **Low.** Any change that forces replacement fails ("name already exists") or detaches the SG from running instances. | `name_prefix` + `create_before_destroy`. |
+| 16 | **No EBS encryption, no detailed monitoring, no tags**; no provider/version pinning | **Low.** Compliance gaps (CV data = PII), no cost allocation, and provider upgrades can change behaviour. | `encrypted = true`, gp3, tags via `default_tags`, `required_providers` pinned. |
+| 17 | **State committed to Git** (see 3.3) | **Critical.** | S3 backend with locking. |
